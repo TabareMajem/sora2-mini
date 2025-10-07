@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import multer from 'multer';
+import sharp from 'sharp';
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import path from 'node:path';
@@ -13,12 +14,19 @@ const OPENAI_ORG = process.env.OPENAI_ORG || '';
 const OPENAI_PROJECT = process.env.OPENAI_PROJECT || '';
 const VIDEO_MODEL = process.env.VIDEO_MODEL || 'sora-2';
 const PORT = process.env.PORT || 4000;
+const FALLBACK_WITHOUT_REF = process.env.FALLBACK_WITHOUT_REF === 'true';
 
 if (!OPENAI_API_KEY) console.warn('[WARN] OPENAI_API_KEY not set');
 
+// org constraints you’ve hit
 const ALLOWED_SECONDS = ['4', '8', '12'];
-const ALLOWED_SIZES = new Set(['1280x720','1920x1080','720x1280','1080x1080']);
-const IMAGE_MIMES = ['image/jpeg','image/png','image/webp']; // image-only
+const DEFAULT_SIZE = '1280x720';
+const UI_SIZES = ['1280x720','1920x1080','720x1280','1080x1080']; // add more if you like
+
+// folders
+const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const LOCK_FILE = path.join(UPLOAD_DIR, 'character-lock.jpg'); // server-side persistent lock
 
 // ====== DB ======
 const dbFile = path.join(process.cwd(), 'history.json');
@@ -65,8 +73,44 @@ async function streamFromOpenAI(url, headers, res, timeoutMs = 300000) {
   else if (r.body?.pipe) r.body.pipe(res);
   else res.end(Buffer.from(await r.arrayBuffer()));
 }
+
 const normSeconds = v => (ALLOWED_SECONDS.includes(String(v||'').trim()) ? String(v).trim() : '4');
-const normSize = v => (ALLOWED_SIZES.has(String(v||'').trim()) ? String(v).trim() : '1280x720');
+const normSize = v => {
+  const m = String(v||'').trim().match(/^(\d+)x(\d+)$/);
+  return m ? `${m[1]}x${m[2]}` : DEFAULT_SIZE;
+};
+const parseSize = v => {
+  const m = String(v||'').trim().match(/^(\d+)x(\d+)$/);
+  if (!m) return { w: 1280, h: 720 };
+  return { w: parseInt(m[1],10), h: parseInt(m[2],10) };
+};
+
+// -- sharp resize/convert to exact size --
+// fitMode: 'cover' (crop to fill) | 'contain' (letterbox)
+async function processImageBufferToSize(inputBuffer, desiredSize, fitMode='cover') {
+  const { w, h } = parseSize(desiredSize);
+  let quality = 85;
+  let out = await sharp(inputBuffer)
+    .resize(w, h, {
+      fit: fitMode === 'contain' ? 'contain' : 'cover',
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    })
+    .jpeg({ quality, mozjpeg: true })
+    .toBuffer();
+
+  // size guard (~15MB)
+  if (out.length > 15 * 1024 * 1024) {
+    quality = 70;
+    out = await sharp(inputBuffer)
+      .resize(w, h, {
+        fit: fitMode === 'contain' ? 'contain' : 'cover',
+        background: { r: 0, g: 0, b: 0, alpha: 0 }
+      })
+      .jpeg({ quality, mozjpeg: true })
+      .toBuffer();
+  }
+  return { buffer: out, mime: 'image/jpeg', filename: `reference_${w}x${h}.jpg` };
+}
 
 // ====== app ======
 const app = express();
@@ -90,6 +134,7 @@ app.get('/', (_req, res) => {
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
   .card{border:1px solid #ddd;border-radius:12px;padding:12px}
   .small{font-size:13px}.pill{display:inline-block;border:1px solid #ccc;border-radius:999px;padding:2px 8px;margin-left:8px}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
 </style>
 <h1>Sora 2 — Prompt to Video</h1>
 
@@ -108,19 +153,45 @@ app.get('/', (_req, res) => {
       <div class="muted small">Your org supports 4, 8, 12s.</div>
     </div>
     <div>
-      <label>Size</label>
+      <label>Size (resolution)</label>
       <select id="size">
-        <option value="1280x720">1280x720 (16:9, 720p)</option>
-        <option value="1920x1080">1920x1080 (16:9, 1080p)</option>
-        <option value="720x1280">720x1280 (9:16 vertical)</option>
-        <option value="1080x1080">1080x1080 (1:1 square)</option>
+        ${UI_SIZES.map(s=>`<option value="${s}">${s}</option>`).join('')}
       </select>
     </div>
   </div>
 
-  <label>Reference image (optional — JPG/PNG/WEBP only)</label>
-  <input id="ref" type="file" accept="image/jpeg,image/png,image/webp">
-  <div class="muted small">Video references (mp4/mov) are not available for your org.</div>
+  <div class="row3">
+    <div>
+      <label>Reference image (optional — JPG/PNG/WEBP)</label>
+      <input id="ref" type="file" accept="image/jpeg,image/png,image/webp">
+      <div class="muted small">We’ll auto-resize to your selected Size.</div>
+    </div>
+    <div>
+      <label>Image fit</label>
+      <select id="fit">
+        <option value="cover">cover (crop to fill)</option>
+        <option value="contain">contain (letterbox)</option>
+      </select>
+      <div class="muted small">Only applies when a reference image is provided.</div>
+    </div>
+    <div>
+      <label>Character Lock</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input id="useLock" type="checkbox">
+        <span class="muted small">Auto-attach server-side locked image</span>
+      </div>
+      <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+        <button id="lockStatus" type="button">Check lock</button>
+        <button id="lockFromThumb" type="button">Lock from last video</button>
+        <label style="display:inline-block">
+          <input id="lockFile" type="file" accept="image/jpeg,image/png,image/webp" style="display:none">
+          <span class="pill" style="cursor:pointer;padding:6px 10px">Upload lock image</span>
+        </label>
+        <button id="lockClear" type="button">Clear lock</button>
+      </div>
+      <div id="lockInfo" class="muted small" style="margin-top:6px"></div>
+    </div>
+  </div>
 
   <button>Generate</button>
 </form>
@@ -143,7 +214,44 @@ app.get('/', (_req, res) => {
 
 <script>
   const $ = id => document.getElementById(id);
-  const statusEl = $('status'), errEl = $('err'), vid = $('vid'), dl = $('dl'), hist = $('hist');
+  const statusEl = $('status'), errEl = $('err'), vid = $('vid'), dl = $('dl'), hist = $('hist'), lockInfo = $('lockInfo');
+
+  async function getJSON(u, opts){ const r = await fetch(u,opts); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||r.status); return j; }
+
+  $('lockStatus').onclick = async () => {
+    errEl.textContent=''; lockInfo.textContent='…';
+    try { const j = await getJSON('/api/lock'); lockInfo.textContent = j.locked ? ('Locked ✓ ('+j.size+')') : 'No lock.'; }
+    catch(e){ lockInfo.textContent = 'Error: '+e.message; }
+  };
+
+  $('lockClear').onclick = async () => {
+    errEl.textContent=''; lockInfo.textContent='…';
+    try { const r = await fetch('/api/lock', { method:'DELETE' }); const j = await r.json(); lockInfo.textContent = j.ok ? 'Lock cleared' : (j.error||'Error'); }
+    catch(e){ lockInfo.textContent = 'Error: '+e.message; }
+  };
+
+  $('lockFile').addEventListener('change', async () => {
+    const f = $('lockFile').files[0]; if(!f) return;
+    errEl.textContent=''; lockInfo.textContent='Uploading…';
+    const fd = new FormData(); fd.append('ref', f);
+    try {
+      const j = await getJSON('/api/lock/upload', { method:'POST', body: fd });
+      lockInfo.textContent = 'Locked ✓ ('+j.size+')';
+    } catch(e){ lockInfo.textContent = 'Error: '+e.message; }
+    $('lockFile').value = '';
+  });
+
+  $('lockFromThumb').onclick = async () => {
+    errEl.textContent=''; lockInfo.textContent='Fetching last thumbnail…';
+    try {
+      // naive: pick most recent completed job from /api/history
+      const hist = await getJSON('/api/history');
+      const done = hist.find(j => ['completed','succeeded','ready'].includes(String(j.status).toLowerCase()));
+      if(!done){ lockInfo.textContent='No completed job found.'; return; }
+      const j = await getJSON('/api/lock/from/'+encodeURIComponent(done.id));
+      lockInfo.textContent = 'Locked from #'+done.id.slice(0,8)+' ✓ ('+j.size+')';
+    } catch(e){ lockInfo.textContent = 'Error: '+e.message; }
+  };
 
   $('f').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -154,14 +262,10 @@ app.get('/', (_req, res) => {
     form.append('prompt', $('prompt').value.trim());
     form.append('seconds', $('seconds').value);
     form.append('size', $('size').value);
+    form.append('fit', $('fit').value);
+    form.append('useLock', $('useLock').checked ? '1' : '0');
     const f = $('ref').files[0];
-    if (f) {
-      if (!/^image\\/(jpeg|png|webp)$/i.test(f.type)) {
-        errEl.textContent = 'Only JPG/PNG/WEBP images are allowed as reference for this org.';
-        statusEl.textContent=''; return;
-      }
-      form.append('ref', f); // image only
-    }
+    if (f) form.append('ref', f);
 
     const r = await fetch('/api/render', { method:'POST', body: form });
     const j = await r.json().catch(()=>({error:'Bad JSON'}));
@@ -242,18 +346,70 @@ app.get('/', (_req, res) => {
 </script>`);
 });
 
-// ====== upload (image-only) ======
+// ====== uploads ======
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const ok = IMAGE_MIMES.includes(file.mimetype || '');
-    cb(ok ? null : new Error('Only JPG/PNG/WEBP images are allowed as reference for this org.'), ok);
+    const ok = /^(image\/(jpeg|png|webp))$/i.test(file.mimetype || '');
+    cb(ok ? null : new Error('Only JPG/PNG/WEBP images are allowed as reference.'), ok);
   }
 });
 
-// ====== CREATE ======
+// ====== Character Lock endpoints ======
+
+// GET status
+app.get('/api/lock', async (_req, res) => {
+  if (!fs.existsSync(LOCK_FILE)) return res.json({ locked: false });
+  const { size } = fs.statSync(LOCK_FILE);
+  res.json({ locked: true, size: (size/1024).toFixed(1)+' KB' });
+});
+
+// DELETE clear
+app.delete('/api/lock', async (_req, res) => {
+  try { if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); }
+  catch { /* ignore */ }
+  res.json({ ok: true });
+});
+
+// POST upload lock image
+app.post('/api/lock/upload', upload.single('ref'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file' });
+    // normalize to a medium baseline (we’ll still resize per-request later)
+    const out = await sharp(req.file.buffer).jpeg({ quality: 90, mozjpeg: true }).toBuffer();
+    fs.writeFileSync(LOCK_FILE, out);
+    return res.json({ ok: true, size: (out.length/1024).toFixed(1)+' KB' });
+  } catch (e) {
+    return res.status(400).json({ error: e?.message || String(e) });
+  }
+});
+
+// GET lock from last job’s thumbnail (or by id you can extend)
+app.get('/api/lock/from/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const url = `https://api.openai.com/v1/videos/${encodeURIComponent(id)}/content?type=thumbnail`;
+    const r = await fetchWithTimeout(url, { headers: apiHeaders() });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(`Fetch thumb failed (${r.status}): ${txt}`);
+    }
+    const arrayBuf = await r.arrayBuffer();
+    const buf = Buffer.from(arrayBuf);
+    // Normalize/store as jpeg
+    const out = await sharp(buf).jpeg({ quality: 90, mozjpeg: true }).toBuffer();
+    fs.writeFileSync(LOCK_FILE, out);
+    return res.json({ ok: true, size: (out.length/1024).toFixed(1)+' KB' });
+  } catch (e) {
+    return res.status(400).json({ error: e?.message || String(e) });
+  }
+});
+
+// ====== CREATE (with Character Lock + fallback) ======
 app.post('/api/render', upload.single('ref'), async (req, res) => {
+  const hadRef = !!req.file;
+  const useLock = req.body?.useLock === '1';
   try {
     if (!OPENAI_API_KEY) throw new Error('Server missing OPENAI_API_KEY.');
     const prompt = (req.body?.prompt || '').trim();
@@ -261,37 +417,66 @@ app.post('/api/render', upload.single('ref'), async (req, res) => {
 
     const seconds = normSeconds(req.body?.seconds);
     const size = normSize(req.body?.size);
+    const fit = (req.body?.fit === 'contain') ? 'contain' : 'cover';
 
-    const form = new FormData();
-    form.append('prompt', prompt);
-    form.append('seconds', seconds);
-    form.append('size', size);
-    form.append('model', VIDEO_MODEL);
+    async function buildForm(includeAdhocRef, includeLock) {
+      const form = new FormData();
+      form.append('prompt', prompt);
+      form.append('seconds', seconds);
+      form.append('size', size);
+      form.append('model', VIDEO_MODEL);
 
-    if (req.file) {
-      // IMAGE reference only
-      const name = req.file.originalname || 'reference.jpg';
-      const mime = req.file.mimetype || 'image/jpeg';
-      if (!IMAGE_MIMES.includes(mime)) {
-        return res.status(400).json({ error: `Only image/jpeg, image/png, image/webp are allowed.` });
+      // Priority: ad-hoc ref (if provided), else lock (if requested and exists)
+      if (includeAdhocRef && req.file) {
+        const { buffer, mime, filename } = await processImageBufferToSize(req.file.buffer, size, fit);
+        const blob = new Blob([buffer], { type: mime });
+        form.append('input_reference', blob, filename);
+      } else if (includeLock && useLock && fs.existsSync(LOCK_FILE)) {
+        const raw = fs.readFileSync(LOCK_FILE);
+        const { buffer, mime, filename } = await processImageBufferToSize(raw, size, fit);
+        const blob = new Blob([buffer], { type: mime });
+        form.append('input_reference', blob, filename);
       }
-      const blob = new Blob([req.file.buffer], { type: mime });
-      form.append('input_reference', blob, name);
+      return form;
     }
 
-    const job = await fetchJSON('https://api.openai.com/v1/videos', {
-      method: 'POST',
-      headers: apiHeaders(), // boundary auto-set
-      body: form
-    });
-
-    await upsertJob(job.id, {
-      prompt, seconds, size,
-      status: job.status || 'queued',
-      createdAt: new Date().toISOString()
-    });
-
-    res.json({ id: job.id });
+    // Attempt 1: include both (ad-hoc ref wins), or lock if requested
+    try {
+      const form1 = await buildForm(true, true);
+      const job1 = await fetchJSON('https://api.openai.com/v1/videos', {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: form1
+      });
+      await upsertJob(job1.id, {
+        prompt, seconds, size,
+        status: job1.status || 'queued',
+        createdAt: new Date().toISOString(),
+        usedLock: (!!useLock && fs.existsSync(LOCK_FILE))
+      });
+      return res.json({ id: job1.id });
+    } catch (err1) {
+      const msg = String(err1?.message || '');
+      const isModeration = /moderation/i.test(msg);
+      const hadAnyRef = hadRef || (useLock && fs.existsSync(LOCK_FILE));
+      if (hadAnyRef && isModeration && FALLBACK_WITHOUT_REF) {
+        // Attempt 2: same request WITHOUT any image reference
+        const form2 = await buildForm(false, false);
+        const job2 = await fetchJSON('https://api.openai.com/v1/videos', {
+          method: 'POST',
+          headers: apiHeaders(),
+          body: form2
+        });
+        await upsertJob(job2.id, {
+          prompt, seconds, size,
+          status: job2.status || 'queued',
+          createdAt: new Date().toISOString(),
+          note: 'reference removed due to moderation'
+        });
+        return res.json({ id: job2.id, note: 'Reference removed due to moderation' });
+      }
+      throw err1;
+    }
   } catch (e) {
     res.status(400).json({ error: 'OpenAI create failed: ' + (e?.message || String(e)) });
   }
