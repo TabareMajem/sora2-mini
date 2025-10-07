@@ -1,18 +1,17 @@
 {
   "name": "sora2-mini",
   "version": "1.0.0",
-  "description": "Tiny Sora 2 prompt → video UI with LowDB history",
-  "license": "ISC",
   "type": "module",
-  "main": "sora2-mini.mjs",
   "scripts": {
     "start": "node sora2-mini.mjs"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18.17"
+  },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
     "lowdb": "^7.0.1",
-    "openai": "^4.60.1"
+    "multer": "^1.4.5-lts.1"
   }
 }
