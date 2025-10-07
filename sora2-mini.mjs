@@ -1,37 +1,30 @@
 import 'dotenv/config';
 import express from 'express';
+import multer from 'multer';
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
-import fs from 'node:fs';
 import path from 'node:path';
-import multer from 'multer';
+import fs from 'node:fs';
 import { Readable } from 'node:stream';
 
-// =================== CONFIG ===================
+// ====== CONFIG ======
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const OPENAI_ORG = process.env.OPENAI_ORG || '';        // optional
-const OPENAI_PROJECT = process.env.OPENAI_PROJECT || ''; // optional
-const VIDEO_MODEL = process.env.VIDEO_MODEL || 'sora-2'; // API default is sora-2
+const OPENAI_ORG = process.env.OPENAI_ORG || '';
+const OPENAI_PROJECT = process.env.OPENAI_PROJECT || '';
+const VIDEO_MODEL = process.env.VIDEO_MODEL || 'sora-2';
 const PORT = process.env.PORT || 4000;
 
-if (!OPENAI_API_KEY) {
-  console.warn('[WARN] OPENAI_API_KEY missing — set it in .env or Render env.');
-}
+if (!OPENAI_API_KEY) console.warn('[WARN] OPENAI_API_KEY not set');
 
-// These seconds values match the error you received from the API: 4, 8, 12
 const ALLOWED_SECONDS = ['4', '8', '12'];
+const ALLOWED_SIZES = new Set(['1280x720','1920x1080','720x1280','1080x1080']);
+const IMAGE_MIMES = ['image/jpeg','image/png','image/webp']; // image-only
 
-// Common reliable sizes
-const ALLOWED_SIZES = new Set(['1280x720', '1920x1080', '720x1280', '1080x1080']);
-
-// =================== DB (LowDB JSON) ===================
-const dbPath = process.env.DB_PATH || 'history.json';
-const dbDir = path.dirname(dbPath);
-if (dbDir && dbDir !== '.' && !fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
-
-const db = new Low(new JSONFile(dbPath), { jobs: [] });
+// ====== DB ======
+const dbFile = path.join(process.cwd(), 'history.json');
+const db = new Low(new JSONFile(dbFile), { jobs: [] });
 await db.read();
-if (!db.data) db.data = { jobs: [] };
+db.data ||= { jobs: [] };
 
 async function upsertJob(id, patch) {
   const i = db.data.jobs.findIndex(j => j.id === id);
@@ -39,10 +32,9 @@ async function upsertJob(id, patch) {
   else db.data.jobs.push({ id, ...patch });
   await db.write();
 }
+const DONE = new Set(['completed','succeeded','ready']);
 
-const DONE = new Set(['completed', 'succeeded', 'ready']);
-
-// =================== HELPERS ===================
+// ====== helpers ======
 function apiHeaders(extra = {}) {
   const h = { Authorization: `Bearer ${OPENAI_API_KEY}`, ...extra };
   if (OPENAI_ORG) h['OpenAI-Organization'] = OPENAI_ORG;
@@ -53,9 +45,9 @@ async function fetchJSON(url, opts = {}, timeoutMs = 120000) {
   const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(url, { ...opts, signal: ctrl.signal });
-    const text = await r.text();
-    if (!r.ok) throw new Error(`${r.status}: ${text}`);
-    return JSON.parse(text);
+    const txt = await r.text();
+    if (!r.ok) throw new Error(`${r.status}: ${txt}`);
+    return JSON.parse(txt);
   } finally { clearTimeout(t); }
 }
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 300000) {
@@ -65,49 +57,25 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 300000) {
 }
 async function streamFromOpenAI(url, headers, res, timeoutMs = 300000) {
   const r = await fetchWithTimeout(url, { headers }, timeoutMs);
-  if (!r.ok) {
-    const body = await r.text();
-    res.status(400).send(`Stream failed (${r.status}): ${body}`);
-    return;
-  }
+  if (!r.ok) { const body = await r.text(); res.status(400).send(`Stream failed (${r.status}): ${body}`); return; }
   const ct = r.headers.get('content-type') || 'video/mp4';
   res.setHeader('Content-Type', ct);
   res.setHeader('Cache-Control', 'no-store');
-  if (r.body?.getReader) { await Readable.fromWeb(r.body).pipe(res); }
-  else if (r.body?.pipe) { r.body.pipe(res); }
-  else { const buf = Buffer.from(await r.arrayBuffer()); res.end(buf); }
+  if (r.body?.getReader) await Readable.fromWeb(r.body).pipe(res);
+  else if (r.body?.pipe) r.body.pipe(res);
+  else res.end(Buffer.from(await r.arrayBuffer()));
 }
+const normSeconds = v => (ALLOWED_SECONDS.includes(String(v||'').trim()) ? String(v).trim() : '4');
+const normSize = v => (ALLOWED_SIZES.has(String(v||'').trim()) ? String(v).trim() : '1280x720');
 
-function clampSize(v) {
-  const s = String(v || '').trim();
-  return ALLOWED_SIZES.has(s) ? s : '1280x720';
-}
-function normalizeSeconds(raw) {
-  // Accept only the three values your org supports; default to '4'
-  const s = String(raw ?? '4').trim();
-  return ALLOWED_SECONDS.includes(s) ? s : '4';
-}
-
-// =================== SERVER ===================
+// ====== app ======
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// optional password gate
-app.use((req, res, next) => {
-  const pass = process.env.APP_PASSWORD;
-  if (!pass) return next();
-  const provided = req.headers['x-app-password'] || req.query.pwd;
-  if (provided === pass) return next();
-  res.status(401).send('Unauthorized. Append ?pwd=YOUR_PASSWORD or set X-App-Password header.');
-});
+app.get('/health', (_req,res)=>res.json({ ok:true, model:VIDEO_MODEL, has_key:!!OPENAI_API_KEY }));
 
-// health
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, model: VIDEO_MODEL, has_api_key: !!OPENAI_API_KEY, time: new Date().toISOString() });
-});
-
-// =================== UI (inline HTML — single file app) ===================
+// ====== UI (inline) ======
 app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -137,7 +105,7 @@ app.get('/', (_req, res) => {
         <option value="8">8</option>
         <option value="12">12</option>
       </select>
-      <div class="muted small">Your org supports these values.</div>
+      <div class="muted small">Your org supports 4, 8, 12s.</div>
     </div>
     <div>
       <label>Size</label>
@@ -150,8 +118,9 @@ app.get('/', (_req, res) => {
     </div>
   </div>
 
-  <label>Reference (image/video, optional)</label>
-  <input id="ref" type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm">
+  <label>Reference image (optional — JPG/PNG/WEBP only)</label>
+  <input id="ref" type="file" accept="image/jpeg,image/png,image/webp">
+  <div class="muted small">Video references (mp4/mov) are not available for your org.</div>
 
   <button>Generate</button>
 </form>
@@ -185,7 +154,14 @@ app.get('/', (_req, res) => {
     form.append('prompt', $('prompt').value.trim());
     form.append('seconds', $('seconds').value);
     form.append('size', $('size').value);
-    if ($('ref').files[0]) form.append('ref', $('ref').files[0]);
+    const f = $('ref').files[0];
+    if (f) {
+      if (!/^image\\/(jpeg|png|webp)$/i.test(f.type)) {
+        errEl.textContent = 'Only JPG/PNG/WEBP images are allowed as reference for this org.';
+        statusEl.textContent=''; return;
+      }
+      form.append('ref', f); // image only
+    }
 
     const r = await fetch('/api/render', { method:'POST', body: form });
     const j = await r.json().catch(()=>({error:'Bad JSON'}));
@@ -213,7 +189,6 @@ app.get('/', (_req, res) => {
         await refreshHistory();
         done = true;
       } else if (String(s.status).toLowerCase()==='in_progress' && Number(progress)===100) {
-        // test stream readiness while we wait for final flip
         const head = await fetch('/api/ping-content/' + j.id + '?type=video');
         if (head.ok) {
           const streamUrl = '/api/content/' + j.id + '?type=video';
@@ -267,26 +242,25 @@ app.get('/', (_req, res) => {
 </script>`);
 });
 
-// =================== UPLOAD ===================
+// ====== upload (image-only) ======
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+  limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const ok = /^(image\/(jpeg|png|webp)|video\/(mp4|quicktime|webm))$/i.test(file.mimetype || '');
-    cb(ok ? null : new Error('Unsupported reference type. Use JPG/PNG/WebP or MP4/MOV/WebM.'), ok);
+    const ok = IMAGE_MIMES.includes(file.mimetype || '');
+    cb(ok ? null : new Error('Only JPG/PNG/WEBP images are allowed as reference for this org.'), ok);
   }
 });
 
-// =================== CREATE ===================
+// ====== CREATE ======
 app.post('/api/render', upload.single('ref'), async (req, res) => {
   try {
     if (!OPENAI_API_KEY) throw new Error('Server missing OPENAI_API_KEY.');
-
     const prompt = (req.body?.prompt || '').trim();
     if (!prompt) return res.status(400).json({ error: 'Empty prompt' });
 
-    const seconds = normalizeSeconds(req.body?.seconds);
-    const size = clampSize(req.body?.size);
+    const seconds = normSeconds(req.body?.seconds);
+    const size = normSize(req.body?.size);
 
     const form = new FormData();
     form.append('prompt', prompt);
@@ -295,16 +269,19 @@ app.post('/api/render', upload.single('ref'), async (req, res) => {
     form.append('model', VIDEO_MODEL);
 
     if (req.file) {
-      // Use Blob in Node, NOT File
-      const mime = req.file.mimetype || 'application/octet-stream';
-      const name = req.file.originalname || 'reference.bin';
+      // IMAGE reference only
+      const name = req.file.originalname || 'reference.jpg';
+      const mime = req.file.mimetype || 'image/jpeg';
+      if (!IMAGE_MIMES.includes(mime)) {
+        return res.status(400).json({ error: `Only image/jpeg, image/png, image/webp are allowed.` });
+      }
       const blob = new Blob([req.file.buffer], { type: mime });
       form.append('input_reference', blob, name);
     }
 
     const job = await fetchJSON('https://api.openai.com/v1/videos', {
       method: 'POST',
-      headers: apiHeaders(), // boundary auto-set by fetch
+      headers: apiHeaders(), // boundary auto-set
       body: form
     });
 
@@ -320,7 +297,7 @@ app.post('/api/render', upload.single('ref'), async (req, res) => {
   }
 });
 
-// =================== STATUS ===================
+// ====== STATUS ======
 app.get('/api/status/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -335,7 +312,7 @@ app.get('/api/status/:id', async (req, res) => {
 
     let status = String(out.status || '').toLowerCase();
 
-    // If stuck at 100, probe content; if streamable, treat as 'ready'
+    // If stuck at 100, probe content; if streamable, mark as ready
     if (status === 'in_progress' && Number(out.progress) === 100) {
       const head = await fetch(`https://api.openai.com/v1/videos/${encodeURIComponent(id)}/content?type=video`, {
         method: 'HEAD', headers: apiHeaders()
@@ -353,7 +330,7 @@ app.get('/api/status/:id', async (req, res) => {
   }
 });
 
-// quick HEAD probe used by the UI at 100%
+// quick HEAD probe
 app.get('/api/ping-content/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -367,11 +344,11 @@ app.get('/api/ping-content/:id', async (req, res) => {
   }
 });
 
-// =================== CONTENT STREAM ===================
+// ====== CONTENT STREAM ======
 app.get('/api/content/:id', async (req, res) => {
   try {
     const id = req.params.id;
-    const t = (req.query.type || 'video').toString(); // 'video' | 'thumbnail' | 'audio'
+    const t = (req.query.type || 'video').toString(); // video | thumbnail | audio
     const url = `https://api.openai.com/v1/videos/${encodeURIComponent(id)}/content?type=${encodeURIComponent(t)}`;
     await streamFromOpenAI(url, apiHeaders(), res);
   } catch (e) {
@@ -379,7 +356,7 @@ app.get('/api/content/:id', async (req, res) => {
   }
 });
 
-// =================== LIST (debug) ===================
+// ====== LIST / HISTORY ======
 app.get('/api/list', async (req, res) => {
   try {
     const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 10));
@@ -389,14 +366,9 @@ app.get('/api/list', async (req, res) => {
     res.status(400).json({ error: 'OpenAI list failed: ' + (e?.message || String(e)) });
   }
 });
-
-// =================== HISTORY ===================
 app.get('/api/history', async (_req, res) => {
   await db.read();
-  const jobs = (db.data.jobs || [])
-    .slice()
-    .sort((a,b) => (b.createdAt||'').localeCompare(a.createdAt||''))
-    .slice(0,50);
+  const jobs = (db.data.jobs || []).slice().sort((a,b) => (b.createdAt||'').localeCompare(a.createdAt||'')).slice(0,50);
   res.json(jobs);
 });
 app.get('/api/job/:id', async (req, res) => {
@@ -406,5 +378,5 @@ app.get('/api/job/:id', async (req, res) => {
   res.json(j);
 });
 
-// =================== START ===================
+// ====== START ======
 app.listen(PORT, () => console.log('Open http://localhost:' + PORT));
