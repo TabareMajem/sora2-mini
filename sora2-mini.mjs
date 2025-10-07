@@ -7,15 +7,24 @@ import path from 'node:path';
 import multer from 'multer';
 import { Readable } from 'node:stream';
 
-// ============ CONFIG ============
+// =================== CONFIG ===================
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_ORG = process.env.OPENAI_ORG || '';        // optional
 const OPENAI_PROJECT = process.env.OPENAI_PROJECT || ''; // optional
-const VIDEO_MODEL = process.env.VIDEO_MODEL || 'sora-2'; // API defaults to sora-2
+const VIDEO_MODEL = process.env.VIDEO_MODEL || 'sora-2'; // API default is sora-2
 const PORT = process.env.PORT || 4000;
-if (!OPENAI_API_KEY) console.warn('[WARN] OPENAI_API_KEY missing. Set it in .env or your host env.');
 
-// ============ DB (LowDB JSON) ============
+if (!OPENAI_API_KEY) {
+  console.warn('[WARN] OPENAI_API_KEY missing — set it in .env or Render env.');
+}
+
+// These seconds values match the error you received from the API: 4, 8, 12
+const ALLOWED_SECONDS = ['4', '8', '12'];
+
+// Common reliable sizes
+const ALLOWED_SIZES = new Set(['1280x720', '1920x1080', '720x1280', '1080x1080']);
+
+// =================== DB (LowDB JSON) ===================
 const dbPath = process.env.DB_PATH || 'history.json';
 const dbDir = path.dirname(dbPath);
 if (dbDir && dbDir !== '.' && !fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
@@ -33,7 +42,7 @@ async function upsertJob(id, patch) {
 
 const DONE = new Set(['completed', 'succeeded', 'ready']);
 
-// ============ HELPERS ============
+// =================== HELPERS ===================
 function apiHeaders(extra = {}) {
   const h = { Authorization: `Bearer ${OPENAI_API_KEY}`, ...extra };
   if (OPENAI_ORG) h['OpenAI-Organization'] = OPENAI_ORG;
@@ -69,16 +78,17 @@ async function streamFromOpenAI(url, headers, res, timeoutMs = 300000) {
   else { const buf = Buffer.from(await r.arrayBuffer()); res.end(buf); }
 }
 
-// Allowed sizes per docs; common reliable set
-const ALLOWED_SIZES = new Set(['1280x720', '1920x1080', '720x1280', '1080x1080']);
+function clampSize(v) {
+  const s = String(v || '').trim();
+  return ALLOWED_SIZES.has(s) ? s : '1280x720';
+}
 function normalizeSeconds(raw) {
-  // Practical ceiling: 20s; many accounts allow 4–10; clamp 1..20 for safety.
-  const n = Number(String(raw || '4').trim());
-  if (Number.isFinite(n)) return String(Math.max(1, Math.min(20, Math.round(n))));
-  return '4';
+  // Accept only the three values your org supports; default to '4'
+  const s = String(raw ?? '4').trim();
+  return ALLOWED_SECONDS.includes(s) ? s : '4';
 }
 
-// ============ SERVER ============
+// =================== SERVER ===================
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -97,7 +107,7 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, model: VIDEO_MODEL, has_api_key: !!OPENAI_API_KEY, time: new Date().toISOString() });
 });
 
-// ============ UI (inline HTML — no external file needed) ============
+// =================== UI (inline HTML — single file app) ===================
 app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -121,8 +131,13 @@ app.get('/', (_req, res) => {
 
   <div class="row">
     <div>
-      <label>Seconds (1–20)</label>
-      <input id="seconds" type="number" min="1" max="20" value="4">
+      <label>Seconds</label>
+      <select id="seconds">
+        <option value="4">4</option>
+        <option value="8">8</option>
+        <option value="12">12</option>
+      </select>
+      <div class="muted small">Your org supports these values.</div>
     </div>
     <div>
       <label>Size</label>
@@ -168,7 +183,7 @@ app.get('/', (_req, res) => {
 
     const form = new FormData();
     form.append('prompt', $('prompt').value.trim());
-    form.append('seconds', String($('seconds').value || '4'));
+    form.append('seconds', $('seconds').value);
     form.append('size', $('size').value);
     if ($('ref').files[0]) form.append('ref', $('ref').files[0]);
 
@@ -252,22 +267,17 @@ app.get('/', (_req, res) => {
 </script>`);
 });
 
-// ============ VALIDATION + UPLOAD ============
+// =================== UPLOAD ===================
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
   fileFilter: (_req, file, cb) => {
     const ok = /^(image\/(jpeg|png|webp)|video\/(mp4|quicktime|webm))$/i.test(file.mimetype || '');
     cb(ok ? null : new Error('Unsupported reference type. Use JPG/PNG/WebP or MP4/MOV/WebM.'), ok);
   }
 });
 
-function clampSize(v) {
-  const s = String(v || '').trim();
-  return ALLOWED_SIZES.has(s) ? s : '1280x720';
-}
-
-// ============ CREATE ============
+// =================== CREATE ===================
 app.post('/api/render', upload.single('ref'), async (req, res) => {
   try {
     if (!OPENAI_API_KEY) throw new Error('Server missing OPENAI_API_KEY.');
@@ -285,16 +295,16 @@ app.post('/api/render', upload.single('ref'), async (req, res) => {
     form.append('model', VIDEO_MODEL);
 
     if (req.file) {
-      const file = new File([req.file.buffer], req.file.originalname || 'reference.bin', {
-        type: req.file.mimetype || 'application/octet-stream'
-      });
-      // API supports an image OR a video reference; send as input_reference (API will infer)
-      form.append('input_reference', file);
+      // Use Blob in Node, NOT File
+      const mime = req.file.mimetype || 'application/octet-stream';
+      const name = req.file.originalname || 'reference.bin';
+      const blob = new Blob([req.file.buffer], { type: mime });
+      form.append('input_reference', blob, name);
     }
 
     const job = await fetchJSON('https://api.openai.com/v1/videos', {
       method: 'POST',
-      headers: apiHeaders(), // do NOT set content-type; fetch sets boundary
+      headers: apiHeaders(), // boundary auto-set by fetch
       body: form
     });
 
@@ -310,7 +320,7 @@ app.post('/api/render', upload.single('ref'), async (req, res) => {
   }
 });
 
-// ============ STATUS ============
+// =================== STATUS ===================
 app.get('/api/status/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -357,7 +367,7 @@ app.get('/api/ping-content/:id', async (req, res) => {
   }
 });
 
-// ============ CONTENT STREAM ============
+// =================== CONTENT STREAM ===================
 app.get('/api/content/:id', async (req, res) => {
   try {
     const id = req.params.id;
@@ -369,7 +379,7 @@ app.get('/api/content/:id', async (req, res) => {
   }
 });
 
-// ============ LIST (debug) ============
+// =================== LIST (debug) ===================
 app.get('/api/list', async (req, res) => {
   try {
     const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 10));
@@ -380,7 +390,7 @@ app.get('/api/list', async (req, res) => {
   }
 });
 
-// ============ HISTORY ============
+// =================== HISTORY ===================
 app.get('/api/history', async (_req, res) => {
   await db.read();
   const jobs = (db.data.jobs || [])
@@ -396,5 +406,5 @@ app.get('/api/job/:id', async (req, res) => {
   res.json(j);
 });
 
-// ============ START ============
+// =================== START ===================
 app.listen(PORT, () => console.log('Open http://localhost:' + PORT));
