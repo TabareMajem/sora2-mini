@@ -820,6 +820,11 @@ app.get('/api/job/:id', async (req,res)=>{
   if (!j) return res.status(404).json({ error:'Not found' });
   res.json(j);
 });
+// last middleware: catch uncaught errors and show JSON
+app.use((err, _req, res, _next) => {
+  console.error('[UNCAUGHT]', err?.stack || err);
+  res.status(500).json({ error: 'Server error', detail: err?.message || String(err) });
+});
 
 // Start
 app.listen(PORT, ()=>console.log('Open http://localhost:'+PORT));
